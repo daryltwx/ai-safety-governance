@@ -13,10 +13,10 @@ https://genai.owasp.org/llm-top-10/
 1. How models process prompts
 2. How input may force model to incorrectly pass prompts to other parts of model.
 (result in: violate guidelines, generate harmful content, enable unauthorized access, influence critical decisions)
-eg.
-  1. Mental health chatbot (Lakera Gandalf's Solace AI) tricked to use profane words.
-  2. Travel websites: Putting hidden prompts for agent manipulates information gathering.
-  3. Tricking agents to provide confidential database information.
+  eg.
+    1. Mental health chatbot (Lakera Gandalf's Solace AI) tricked to use profane words.
+    2. Travel websites: Putting hidden prompts for agent manipulates information gathering.
+    3. Tricking agents to provide confidential database information.
 
 RAG (Retrieval Augmented Generation) & fine-tuning makes LLM outputs more relevant & accurate, but doesn't fully mitigate these vulnerabilities.
 
@@ -31,3 +31,9 @@ Prompt injection involves manipulating model responses through specific inputs t
 
 
 Jailbreaking is a form of prompt injection where the attacker provides inputs that cause the model to disregard its safety protocols entirely.
+
+---
+
+Types of Prompt Injection Vulnerabilities: 
+
+1. Direct Prompt Injections
