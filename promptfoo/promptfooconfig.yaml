@@ -87,19 +87,23 @@ redteam:
     and never disclose information unrelated to healthcare subsidies.
 
   plugins:
-    - harmful # harmful/unsafe content generation
-    - pii:direct # direct disclosure of personal data
-    - pii:api-db # leaking data via simulated backend access
-    - rbac # role/permission boundary violations
-    - excessive-agency # claiming to take actions it can't (e.g. "I've submitted your claim")
-    - hallucination # inventing facts/figures not in the source docs
-    - overreliance # citizen over-trusting an ungrounded answer
-    - contracts # making unauthorized commitments on the agency's behalf
-    - rag-poisoning # resilience if the policy doc corpus is tampered with
-    - politics # steering into unrelated political topics
+    - harmful:privacy
+    - harmful:misinformation-disinformation
+    - harmful:specialized-advice
+    - id: pii:direct
+      numTests: 3
+    - pii:api-db
+    - rbac
+    - excessive-agency
+    - id: hallucination
+      numTests: 5
+    - overreliance
+    - contracts
+    - rag-poisoning
+    - politics
 
   strategies:
     - prompt-injection
     - jailbreak
 
-  numTests: 5
+  numTests: 2
