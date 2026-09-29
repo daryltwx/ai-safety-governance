@@ -30,9 +30,12 @@ SYSTEM_PROMPT = (
 )
 
 
-def call_ollama(question: str, docs: list) -> str:
+def call_ollama(question: str, docs: list, timeout: int = 120, retries: int = 1) -> str:
     """Send retrieved doc snippets + the question to a local Ollama model.
-    Raises requests.exceptions.RequestException if Ollama isn't reachable."""
+    Raises requests.exceptions.RequestException if Ollama isn't reachable after
+    all retries. Timeout is generous (120s) because Ollama serves one
+    generation at a time by default — under red-team test load, later
+    requests spend most of that time queued, not generating."""
     context = "\n\n".join(f"[{d['id']}] {d['text']}" for d in docs) or "(no matching excerpts found)"
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
@@ -40,13 +43,22 @@ def call_ollama(question: str, docs: list) -> str:
         f"Citizen question: {question}\n\n"
         f"Answer:"
     )
-    resp = requests.post(
-        OLLAMA_URL,
-        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json().get("response", "").strip()
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.post(
+                OLLAMA_URL,
+                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            text = resp.json().get("response", "").strip()
+            if not text:
+                raise ValueError("empty response from model")
+            return text
+        except (requests.exceptions.RequestException, ValueError) as e:
+            last_err = e
+    raise last_err
 
 # ---- Mock "policy document" corpus for simulated RAG ----
 # In a real deployment, replace search_docs() with a call to the RAG
@@ -146,22 +158,19 @@ def api_ask():
 
     try:
         reply = call_ollama(message, docs)
-        if not reply:
-            raise ValueError("empty response from model")
     except (requests.exceptions.RequestException, ValueError) as e:
-        # Ollama not running / unreachable / bad response — fall back to the
-        # plain retrieved-snippet behaviour rather than failing the request.
-        app.logger.warning("Ollama call failed, falling back to raw snippets: %s", e)
-        if docs:
-            reply = " ".join(d["text"] for d in docs)
-        else:
-            reply = (
-                "I couldn't find a matching policy passage in the demo "
-                "document set for that question. In production this would "
-                "fall back to a human handoff. (Note: local LLM at "
-                f"{OLLAMA_URL} was unreachable, so this is the raw-retrieval "
-                "fallback.)"
-            )
+        # Ollama unreachable/timed out/bad response after retries. Return this
+        # as a distinct error, NOT a 200 with plausible chat text — a fake
+        # "I don't have that information" reply here is indistinguishable
+        # from a real grounded refusal to a grader, and quietly launders
+        # every prompt that hit this path (e.g. red-team probes) into a
+        # false "safe" result instead of actually testing the model.
+        app.logger.warning("Ollama call failed after retries: %s", e)
+        return jsonify({
+            "type": "error",
+            "error": "llm_unavailable",
+            "detail": f"Local LLM at {OLLAMA_URL} did not respond in time.",
+        }), 503
 
     return jsonify({"type": "text", "reply": reply, "citations": citations})
 
@@ -180,4 +189,4 @@ def api_eligibility():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5050)

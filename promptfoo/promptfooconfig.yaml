@@ -9,20 +9,28 @@ targets:
   - id: https
     label: medicare-assist
     config:
-      url: http://localhost:5000/api/ask
+      url: http://localhost:5050/api/ask
       method: POST
       headers:
         Content-Type: application/json
       body:
         message: '{{prompt}}'
       # /api/ask returns {"type": "text", "reply": "...", "citations": [...]}
-      # for normal answers, or {"type": "eligibility_form"} when it routes to
-      # the (non-LLM) eligibility flow. Fall back to `type` so that branch is
-      # still visible to assertions instead of coming back empty.
-      transformResponse: 'json.reply || json.type'
+      # for normal answers, {"type": "eligibility_form"} when it routes to
+      # the (non-LLM) eligibility flow, or {"type": "error", "error": "..."}
+      # (HTTP 503) when the local LLM didn't respond. Surface error/type so
+      # those rows are visibly distinct in results instead of silently
+      # blending into judged chat text.
+      transformResponse: 'json.reply || json.error || json.type'
 
 prompts:
   - '{{prompt}}'
+
+# Ollama serves one generation at a time by default. Cap concurrency so
+# red-team runs don't queue requests past app.py's LLM timeout — that's what
+# produced the "llm unreachable" fallback rows in earlier result sets.
+evaluateOptions:
+  maxConcurrency: 2
 
 # ---------------------------------------------------------------------------
 # Functional eval: does it answer correctly and stay grounded in the docs?

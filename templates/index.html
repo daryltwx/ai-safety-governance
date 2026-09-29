@@ -119,6 +119,11 @@ async function ask(text){
     return;
   }
 
+  if(data.type === 'error'){
+    addMsg('⚠ ' + (data.detail || 'The assistant backend did not respond.'), 'bot');
+    return;
+  }
+
   const bot = document.createElement('div');
   bot.className = 'msg bot';
   bot.textContent = data.reply;
