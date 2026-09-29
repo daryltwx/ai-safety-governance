@@ -1,0 +1,112 @@
+name: Red-team
+
+on:
+  pull_request:
+  schedule:
+    - cron: '0 3 * * *'   # nightly full sweep, 03:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  # Fast, deterministic, blocking. One case per confirmed finding — see
+  # promptfoo/ci-regression.yaml. No external grading LLM, no API key,
+  # runs in well under a minute of model time.
+  regression:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama and pull the small CI model
+        run: |
+          ollama serve &
+          for i in $(seq 1 30); do curl -sf http://localhost:11434 && break; sleep 1; done
+          ollama pull qwen2.5:1.5b
+
+      - name: Install app dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start the app
+        env:
+          OLLAMA_MODEL: qwen2.5:1.5b   # CI proxy model — NOT the real target model
+        run: |
+          python app.py &
+          for i in $(seq 1 30); do curl -sf http://localhost:5050 && break; sleep 1; done
+
+      - name: Run regression suite
+        run: npx --yes promptfoo@0.100.0 eval -c promptfoo/ci-regression.yaml --output results.csv
+
+      - name: Gate on results
+        run: python promptfoo/ci_gate.py results.csv --max-untested-pct 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: redteam-regression-${{ github.run_id }}
+          path: results.csv
+
+  # Slow, broad, non-blocking. Full 34-category corpus against the real
+  # target model. Needs an external grading LLM (promptfoo defaults to
+  # OpenAI for its built-in redteam plugins/jailbreak:meta attacker) — set
+  # OPENAI_API_KEY as a repo secret before enabling this job for real.
+  full-sweep:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama and pull the real target model
+        run: |
+          ollama serve &
+          for i in $(seq 1 30); do curl -sf http://localhost:11434 && break; sleep 1; done
+          ollama pull qwen2.5:14b
+
+      - name: Install app dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start the app
+        run: |
+          python app.py &
+          for i in $(seq 1 60); do curl -sf http://localhost:5050 && break; sleep 1; done
+
+      - name: Run full red-team corpus
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: npx --yes promptfoo@0.100.0 redteam run -c promptfoo/promptfooconfig.yaml --output results.csv
+
+      - name: Build dated results folder
+        run: |
+          STAMP=$(date -u +%Y-%m-%d_%H-%M-%S)
+          COUNT=$(($(wc -l < results.csv) - 1))
+          DIR="promptfoo/results/${STAMP}_${COUNT}tests"
+          mkdir -p "$DIR"
+          mv results.csv "$DIR/report_eval-${{ github.run_id }}.csv"
+          echo "RESULTS_DIR=$DIR" >> "$GITHUB_ENV"
+
+      # Non-blocking by design — this sweep surfaces new findings for human
+      # review, it does not gate the merge. Wire failure notification (e.g.
+      # open an issue, post to Slack) here once a real endpoint is in scope.
+      - name: Check for regressions (report only, do not fail the job)
+        run: python promptfoo/ci_gate.py "$RESULTS_DIR"/*.csv --max-untested-pct 0 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redteam-full-sweep-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
