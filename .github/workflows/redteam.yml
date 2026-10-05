@@ -42,7 +42,7 @@ jobs:
           for i in $(seq 1 30); do curl -sf http://localhost:5050 && break; sleep 1; done
 
       - name: Run regression suite
-        run: npx --yes promptfoo@0.100.0 eval -c promptfoo/ci-regression.yaml --output results.csv
+        run: npx --yes promptfoo@0.123.1 eval -c promptfoo/ci-regression.yaml --output results.csv
 
       - name: Gate on results
         run: python promptfoo/ci_gate.py results.csv --max-untested-pct 0
@@ -89,7 +89,7 @@ jobs:
       - name: Run full red-team corpus
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: npx --yes promptfoo@0.100.0 redteam run -c promptfoo/promptfooconfig.yaml --output results.csv
+        run: npx --yes promptfoo@0.123.1 redteam run -c promptfoo/promptfooconfig.yaml --output results.csv
 
       - name: Build dated results folder
         run: |
