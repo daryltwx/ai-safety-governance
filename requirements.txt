@@ -1,2 +1,5 @@
 Flask>=3.0
-requests>=2.31
+langchain-core>=0.3
+langchain-ollama>=0.3
+ollama>=0.4
+httpx>=0.27
