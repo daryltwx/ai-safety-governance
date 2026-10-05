@@ -264,6 +264,53 @@ def search_docs(query: str, top_n: int = 2):
     return [doc for _, doc in scored[:top_n]]
 
 
+REFORMULATE_PROMPT = PromptTemplate.from_template(
+    "A citizen asked a government healthcare-subsidy chatbot this question:\n"
+    "\"{question}\"\n\n"
+    "A keyword search against our policy document titles/topics found no "
+    "match. Propose ONE short alternative search phrase (3-6 words, plain "
+    "keywords only) using different wording that might match a policy "
+    "document about Singapore healthcare subsidies, MediSave, outpatient "
+    "claims, eligibility, appeals, or data privacy. Respond with only the "
+    "phrase — no punctuation, no explanation."
+)
+
+
+def reformulate_query(question: str, timeout: int = 30) -> str:
+    """One cheap LLM call asking for an alternative search phrase when the
+    first keyword search comes up empty. This is the one place the model
+    gets to drive what happens next instead of fixed Python logic — but
+    it's bounded (agentic_retrieve caps retries) and purely read-only, so a
+    bad or adversarial rephrasing can only lead to another doc search, not
+    a different code path or a privileged action."""
+    llm = OllamaLLM(model=OLLAMA_MODEL, base_url=OLLAMA_URL, client_kwargs={"timeout": timeout})
+    chain = REFORMULATE_PROMPT | llm
+    try:
+        return chain.invoke({"question": question}).strip().strip('"')
+    except OLLAMA_ERRORS:
+        return ""
+
+
+def agentic_retrieve(question: str, top_n: int = 2, max_reformulations: int = 1):
+    """search_docs(), and if that comes up empty, let the model propose an
+    alternative phrasing and retry — up to max_reformulations times. Only
+    ever widens *how* we search, never what gets returned to the citizen
+    without going through the same grounding verifier as any other reply."""
+    docs = search_docs(question, top_n=top_n)
+    attempts = [{"query": question, "found": len(docs)}]
+    for _ in range(max_reformulations):
+        if docs:
+            break
+        alt_query = reformulate_query(question)
+        if not alt_query:
+            break
+        docs = search_docs(alt_query, top_n=top_n)
+        attempts.append({"query": alt_query, "found": len(docs)})
+    if len(attempts) > 1:
+        app.logger.info("Agentic retrieval retried: %s", attempts)
+    return docs
+
+
 # ---- Mock "backend" citizen records ----
 # Fake PII, invented for this security-assessment prototype. Exists so
 # PII-leak red-team tests have real data to actually test against, instead
@@ -380,7 +427,7 @@ def api_ask():
     if "eligib" in lower or "qualify" in lower:
         return jsonify({"type": "eligibility_form"})
 
-    docs = search_docs(message)
+    docs = agentic_retrieve(message)
     citations = [{"id": d["id"], "title": d["title"]} for d in docs]
     citizen_records = lookup_citizen_records(message)
 
