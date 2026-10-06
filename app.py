@@ -7,8 +7,9 @@ no write operations.
 
 Run:
     pip install -r requirements.txt
+    cp .env.example .env   # edit if you need non-default settings
     python app.py
-Then open http://localhost:5000
+Then open http://localhost:5050 (or whatever PORT is set to in .env)
 """
 from flask import Flask, request, jsonify, render_template
 import os
@@ -20,14 +21,20 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama, OllamaLLM
+from langfuse import Langfuse, get_client, observe
+from langfuse.langchain import CallbackHandler
+
+import config
 
 app = Flask(__name__)
 
 # ---- Local LLM (Ollama, via LangChain) config ----
-OLLAMA_URL = "http://localhost:11434"
-# Override via env for CI, where qwen2.5:14b is too slow on a CPU-only
-# runner — e.g. OLLAMA_MODEL=qwen2.5:1.5b for the fast PR-gate suite.
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
+# Both overridable via .env (see .env.example) or a real env var (CI sets
+# OLLAMA_MODEL this way, e.g. qwen2.5:1.5b -- qwen2.5:14b is too slow on
+# a CPU-only runner). config.py is the one place these are read from the
+# environment; everything else just imports the resolved values.
+OLLAMA_URL = config.OLLAMA_URL
+OLLAMA_MODEL = config.OLLAMA_MODEL
 
 # Exceptions the ollama client (used under the hood by langchain-ollama)
 # raises for an unreachable/slow/erroring server. httpx.HTTPError is the
@@ -75,6 +82,43 @@ UPLOADED_DOCUMENT = None
 # Singapore NRIC/FIN: one letter, seven digits, one letter. Matches the
 # format used by SESSION_NRIC/CITIZEN_RECORDS and the redteam probes.
 NRIC_PATTERN = re.compile(r"\b[STFG]\d{7}[A-Z]\b", re.IGNORECASE)
+
+# ---- Langfuse tracing ----
+# Observability for the agentic pipeline (tool calls, retries, verifier
+# checks). Configured via env vars (LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY,
+# LANGFUSE_BASE_URL -- defaults to Langfuse Cloud if unset). Confirmed
+# this is a safe no-op when the vars are genuinely absent: the client
+# logs a warning and disables itself rather than failing requests. NOT
+# the same as present-but-empty -- confirmed that makes the OTel exporter
+# actually attempt network calls and retry/fail on every request instead.
+# See .env.example: the Langfuse lines are commented out by default, not
+# left blank, specifically to keep them genuinely absent.
+#
+# `mask` below is a last-resort backstop, not the primary PII control --
+# tokenize_pii()/mask_record() upstream are. It exists because not every
+# model call in this app goes through that path: reformulate_query() gets
+# the raw citizen question (tokenization happens later, inside
+# call_ollama), and reply_is_grounded() checks the already-detokenized
+# real reply. Both are pre-existing gaps, not introduced by tracing -- but
+# tracing is what would otherwise turn them into a concrete leak on every
+# request, by shipping real PII to a third party (Langfuse Cloud) in the
+# trace itself. This regex-redacts NRIC-shaped text from every span's
+# captured input/output in-process, before serialization, before any
+# network call -- same structured-identifier-only limitation as
+# tokenize_pii(), not a fix for the underlying call-order gaps.
+def _mask_pii(*, data, **_kwargs):
+    if isinstance(data, str):
+        return NRIC_PATTERN.sub("[REDACTED_NRIC]", data)
+    if isinstance(data, dict):
+        return {k: _mask_pii(data=v) for k, v in data.items()}
+    if isinstance(data, (list, tuple)):
+        return [_mask_pii(data=v) for v in data]
+    return data
+
+
+Langfuse(mask=_mask_pii)
+langfuse_handler = CallbackHandler()
+LANGFUSE_CONFIG = {"callbacks": [langfuse_handler]}
 
 
 @tool
@@ -311,7 +355,7 @@ def execute_tool_call(call: dict, call_index: int, token_map: dict, untrusted_to
             # resolve the token back to a real value right here,
             # server-side, immediately before the DB lookup.
             real_nric = token_map.get(token_arg, token_arg)
-            raw_result = lookup_citizen_record.invoke({"nric": real_nric})
+            raw_result = lookup_citizen_record.invoke({"nric": real_nric}, config=LANGFUSE_CONFIG)
             if "error" in raw_result:
                 # Don't forward the tool's own error message —
                 # lookup_citizen_record() builds it from the real
@@ -322,7 +366,7 @@ def execute_tool_call(call: dict, call_index: int, token_map: dict, untrusted_to
                 content = str(mask_record(raw_result, call_index, token_map))
 
     elif name == "read_uploaded_document":
-        raw_result = read_uploaded_document.invoke({})
+        raw_result = read_uploaded_document.invoke({}, config=LANGFUSE_CONFIG)
         if "error" in raw_result:
             content = str(raw_result)
         else:
@@ -353,10 +397,12 @@ def execute_tool_call(call: dict, call_index: int, token_map: dict, untrusted_to
 # repeatedly calling tools turns one citizen question into unbounded LLM
 # calls — and Ollama serves one generation at a time by default, so an
 # uncapped loop is a real DoS surface on the one shared backend, not just
-# a latency annoyance. 4 is generous for this app's two tools (read the
-# document, then look up a record, plus a little slack) without being
-# effectively unbounded.
-MAX_TOOL_ROUNDS = 4
+# a latency annoyance. 4 (config.MAX_TOOL_ROUNDS's default) is generous
+# for this app's two tools (read the document, then look up a record,
+# plus a little slack) without being effectively unbounded. Overridable
+# via .env for experimentation -- not something a deployment should need
+# to raise without re-examining why.
+MAX_TOOL_ROUNDS = config.MAX_TOOL_ROUNDS
 
 
 def call_ollama(question: str, docs: list, timeout: int = 120, retries: int = 1) -> str:
@@ -398,7 +444,7 @@ def call_ollama(question: str, docs: list, timeout: int = 120, retries: int = 1)
                 SystemMessage(content=SYSTEM_PROMPT),
                 HumanMessage(content=f"Policy excerpts:\n{context}\n\nCitizen question: {tokenized_question}"),
             ]
-            response = llm_with_tools.invoke(messages)
+            response = llm_with_tools.invoke(messages, config=LANGFUSE_CONFIG)
 
             rounds = 0
             while response.tool_calls and rounds < MAX_TOOL_ROUNDS:
@@ -406,7 +452,7 @@ def call_ollama(question: str, docs: list, timeout: int = 120, retries: int = 1)
                 messages.append(response)
                 for idx, call in enumerate(response.tool_calls, start=1):
                     messages.append(execute_tool_call(call, idx, token_map, untrusted_tokens))
-                response = llm_with_tools.invoke(messages)
+                response = llm_with_tools.invoke(messages, config=LANGFUSE_CONFIG)
 
             text = (response.content or "").strip()
             if not text:
@@ -462,7 +508,14 @@ def reply_is_grounded(answer: str, docs: list, timeout: int = 60) -> tuple:
     llm = OllamaLLM(model=OLLAMA_MODEL, base_url=OLLAMA_URL, client_kwargs={"timeout": timeout})
     chain = VERIFIER_PROMPT | llm
     try:
-        verdict = chain.invoke({"context": context, "answer": answer, "guidelines": guidelines}).strip()
+        # `answer` here is call_ollama()'s already-detokenized output — this
+        # call ships real PII to OLLAMA_MODEL (or whatever it's swapped to)
+        # regardless of tracing. _mask_pii (see Langfuse setup above) is
+        # the only thing stopping that from also reaching the trace export.
+        verdict = chain.invoke(
+            {"context": context, "answer": answer, "guidelines": guidelines},
+            config=LANGFUSE_CONFIG,
+        ).strip()
     except OLLAMA_ERRORS:
         return True, ""
     if verdict.upper().startswith("PASS"):
@@ -576,7 +629,13 @@ def reformulate_query(question: str, timeout: int = 30) -> str:
     llm = OllamaLLM(model=OLLAMA_MODEL, base_url=OLLAMA_URL, client_kwargs={"timeout": timeout})
     chain = REFORMULATE_PROMPT | llm
     try:
-        return chain.invoke({"question": question}).strip().strip('"')
+        # `question` here is the raw citizen message — called before
+        # call_ollama() ever tokenizes it (agentic_retrieve runs first in
+        # api_ask). This call ships real PII to OLLAMA_MODEL regardless of
+        # tracing; _mask_pii (Langfuse setup above) is the only thing
+        # stopping that from also reaching the trace export. Pre-existing
+        # gap, not introduced by tracing — see docs/2026-10-06 session note.
+        return chain.invoke({"question": question}, config=LANGFUSE_CONFIG).strip().strip('"')
     except OLLAMA_ERRORS:
         return ""
 
@@ -663,12 +722,23 @@ def looks_like_emergency(message: str) -> bool:
     return any(p.search(message) for p in EMERGENCY_PATTERNS)
 
 
+@app.after_request
+def _flush_langfuse(response):
+    # Dev server is short-lived per request; flush explicitly rather than
+    # waiting on Langfuse's background batching interval, so traces show
+    # up promptly instead of sitting in the client's buffer. No-op (cheap)
+    # when tracing is disabled (no API keys configured) or queue is empty.
+    get_client().flush()
+    return response
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
 
 
 @app.route("/api/ask", methods=["POST"])
+@observe(name="api_ask", capture_input=False, capture_output=False)
 def api_ask():
     data = request.get_json(force=True) or {}
     message = str(data.get("message", "")).strip()
@@ -737,4 +807,4 @@ def api_eligibility():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5050)
+    app.run(debug=config.FLASK_DEBUG, port=config.PORT)
