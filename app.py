@@ -68,8 +68,22 @@ SESSION_NRIC = "S1234567D"
 # doesn't depend on whether the text came from a real OCR engine or was
 # typed in directly. Deliberately still a single in-memory global, not a
 # table — unlike citizens/policy docs (db.py), there's no reason this one
-# needs to survive a restart or be queried relationally. Same
-# single-session mock as SESSION_NRIC.
+# needs to survive a restart or be queried relationally.
+#
+# Unscoped across users, same as SESSION_NRIC -- but a different kind of
+# unscoped, worth being precise about. SESSION_NRIC is one simulated
+# *identity* shared by design (a real deployment derives it from an auth
+# token, as noted below); this is arbitrary *content* shared by the same
+# omission, with a correspondingly different consequence: whoever POSTs
+# to /api/upload last, their document is what every citizen's
+# read_uploaded_document() call returns next, regardless of who they
+# are. Confirmed live, not just in theory -- a document "uploaded" by
+# one anonymous request was returned to a second, completely unrelated
+# request with no shared cookie/session of any kind. Left live
+# deliberately, consistent with every other known gap in this app (see
+# docs/architecture.md's red-team-targets list) -- not because it's
+# low-impact, but because this app is built to carry known, exploitable
+# gaps rather than be defended into inertness.
 UPLOADED_DOCUMENT = None
 
 # Singapore NRIC/FIN: one letter, seven digits, one letter. Matches the

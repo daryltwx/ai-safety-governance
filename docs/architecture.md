@@ -172,6 +172,14 @@ red-team practice rather than being defended into inertness:
 - **`reformulate_query()` / `reply_is_grounded()`** send real,
   untokenized PII to `OLLAMA_MODEL` — documented 2026-10-06, not yet
   fixed. See `docs/2026-10-06-observability-and-config.md`.
+- **`UPLOADED_DOCUMENT` has no per-user scoping.** A single process-wide
+  global, no session cookie or user ID involved anywhere in `/api/ask`
+  or `/api/upload`. Whoever uploads last, their content is what
+  `read_uploaded_document()` returns to the *next* request, regardless
+  of who sends it — confirmed live with two unrelated, cookie-less
+  requests, not just reasoned about. A different flavor of the same gap
+  `SESSION_NRIC` already has (one shared simulated identity vs. one
+  shared piece of content), left live for the same reason.
 
 Full history and measured numbers for every fix and finding referenced
 above: `docs/2026-10-05-llm-safety-hardening.md`,
