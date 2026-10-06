@@ -1,0 +1,45 @@
+# Run: cp .env.example .env   (if you haven't already)
+#      docker compose up --build
+# Then, once ollama is healthy, pull a model into it (one-time, persists
+# in the ollama_data volume across restarts):
+#      docker compose exec ollama ollama pull qwen2.5:14b
+#
+# Two services, networked together: `app` reaches `ollama` via Docker's
+# internal DNS (http://ollama:11434), not the localhost default app.py
+# uses for non-Docker dev -- the `environment:` override below is what
+# makes that switch, taking precedence over whatever OLLAMA_URL is set
+# to in .env.
+services:
+  app:
+    build: .
+    ports:
+      - "${PORT:-5050}:${PORT:-5050}"
+    env_file:
+      - .env
+    environment:
+      OLLAMA_URL: http://ollama:11434
+    volumes:
+      # Bind-mount so edits to app.py/guidelines.md take effect live via
+      # Flask's debug reloader, same dev workflow as running it outside
+      # Docker -- guidelines.md is deliberately read fresh per request
+      # (see load_guidelines()'s docstring), not just at container start.
+      - .:/app
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  ollama_data:
