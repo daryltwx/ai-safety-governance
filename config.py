@@ -36,6 +36,22 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:14b")
 # ---- Bounded ReAct loop ----
 MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "4"))
 
+# ---- Database (Postgres + pgvector) ----
+# Holds citizen/claims records (real schema, always-synthetic data -- see
+# seed_data.py) and the RAG policy-document embeddings, in one engine.
+# The default below is for non-Docker local dev against a Postgres you've
+# started yourself; docker-compose.yml overrides this to point at the
+# `db` service instead. Credentials are a fixed local-dev default, not a
+# secret -- this database never holds real PII, by design (see
+# docs/2026-10-06-real-database-and-rag.md).
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql+psycopg2://medicare:medicare@localhost:5432/medicare")
+
+# ---- RAG embeddings ----
+# Local embedding model served by the same Ollama instance as the chat
+# model -- keeps the whole pipeline (chat + embeddings) on one backend
+# with no external API key required.
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "nomic-embed-text")
+
 # ---- Flask ----
 PORT = int(os.environ.get("PORT", "5050"))
 FLASK_DEBUG = _bool("FLASK_DEBUG", True)

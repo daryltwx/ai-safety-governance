@@ -1,14 +1,18 @@
 # Run: cp .env.example .env   (if you haven't already)
 #      docker compose up --build
-# Then, once ollama is healthy, pull a model into it (one-time, persists
-# in the ollama_data volume across restarts):
+# Then, once ollama is healthy, pull the chat model and the embedding
+# model (one-time, both persist in the ollama_data volume):
 #      docker compose exec ollama ollama pull qwen2.5:14b
+#      docker compose exec ollama ollama pull nomic-embed-text
+# Then seed the database (synthetic citizens/claims + embedded policy
+# corpus -- see seed_data.py, no real PII ever touches this):
+#      docker compose exec app python seed_data.py
 #
-# Two services, networked together: `app` reaches `ollama` via Docker's
-# internal DNS (http://ollama:11434), not the localhost default app.py
-# uses for non-Docker dev -- the `environment:` override below is what
-# makes that switch, taking precedence over whatever OLLAMA_URL is set
-# to in .env.
+# Three services, networked together: `app` reaches `ollama` via
+# http://ollama:11434 and `db` via postgresql://...@db:5432/... --
+# Docker's internal DNS, not the localhost defaults app.py uses for
+# non-Docker dev. The `environment:` overrides below are what make that
+# switch, taking precedence over whatever's in .env.
 services:
   app:
     build: .
@@ -18,6 +22,7 @@ services:
       - .env
     environment:
       OLLAMA_URL: http://ollama:11434
+      DATABASE_URL: postgresql+psycopg2://medicare:medicare@db:5432/medicare
     volumes:
       # Bind-mount so edits to app.py/guidelines.md take effect live via
       # Flask's debug reloader, same dev workflow as running it outside
@@ -26,6 +31,8 @@ services:
       - .:/app
     depends_on:
       ollama:
+        condition: service_healthy
+      db:
         condition: service_healthy
 
   ollama:
@@ -41,5 +48,27 @@ services:
       retries: 10
       start_period: 10s
 
+  db:
+    # pgvector/pgvector ships the vector extension preinstalled on top of
+    # the official postgres image -- one database engine serves both the
+    # relational citizen/claims schema and the RAG embeddings table,
+    # rather than standing up a separate vector DB service.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: medicare
+      POSTGRES_PASSWORD: medicare
+      POSTGRES_DB: medicare
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medicare -d medicare"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
 volumes:
   ollama_data:
+  pg_data:

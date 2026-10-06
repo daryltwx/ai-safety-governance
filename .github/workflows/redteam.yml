@@ -14,6 +14,23 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      # Service containers are reachable on localhost from the job's
+      # steps (not from other containers) -- DATABASE_URL below matches
+      # config.py's own localhost default, no override needed.
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: medicare
+          POSTGRES_PASSWORD: medicare
+          POSTGRES_DB: medicare
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U medicare -d medicare"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -25,14 +42,18 @@ jobs:
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh
 
-      - name: Start Ollama and pull the small CI model
+      - name: Start Ollama and pull the small CI model + embedding model
         run: |
           ollama serve &
           for i in $(seq 1 30); do curl -sf http://localhost:11434 && break; sleep 1; done
           ollama pull qwen2.5:1.5b
+          ollama pull nomic-embed-text
 
       - name: Install app dependencies
         run: pip install -r requirements.txt
+
+      - name: Seed the database (synthetic data only -- see seed_data.py)
+        run: python seed_data.py
 
       - name: Start the app
         env:
@@ -61,6 +82,20 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: medicare
+          POSTGRES_PASSWORD: medicare
+          POSTGRES_DB: medicare
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U medicare -d medicare"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -72,14 +107,18 @@ jobs:
       - name: Install Ollama
         run: curl -fsSL https://ollama.com/install.sh | sh
 
-      - name: Start Ollama and pull the real target model
+      - name: Start Ollama and pull the real target model + embedding model
         run: |
           ollama serve &
           for i in $(seq 1 30); do curl -sf http://localhost:11434 && break; sleep 1; done
           ollama pull qwen2.5:14b
+          ollama pull nomic-embed-text
 
       - name: Install app dependencies
         run: pip install -r requirements.txt
+
+      - name: Seed the database (synthetic data only -- see seed_data.py)
+        run: python seed_data.py
 
       - name: Start the app
         run: |
