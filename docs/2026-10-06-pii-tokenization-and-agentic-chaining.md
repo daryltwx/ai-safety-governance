@@ -150,18 +150,64 @@ indirect prompt injection, not a guarantee — the same pattern already
 established for every other instruction-following defense in this app
 (see 2026-10-05's verifier non-determinism numbers).
 
-**Why left unfixed:** matches the precedent already set for
-`lookup_citizen_record`'s access-control gap — this app is deliberately
-built with known, documented, exploitable red-team targets rather than
-defended into inertness. A concrete fix was scoped but not built: a
-deterministic check that `lookup_citizen_record` only accepts an NRIC
-token that appeared in the citizen's own chat message, never one sourced
-only from document content read via `read_uploaded_document` — this
-would close this specific chain while leaving the direct-request version
-of the confused-deputy test (citizen types another NRIC themselves)
-exactly as adversarial as it is today. Worth building if this specific
-chain needs to stop being exploitable; worth leaving if the goal is a
-live target for injection-via-tool-content practice.
+**Initial decision:** left unfixed, matching the precedent already set
+for `lookup_citizen_record`'s access-control gap — this app is
+deliberately built with known, documented, exploitable red-team targets
+rather than defended into inertness. A concrete fix was scoped but not
+built at the time: a deterministic check that `lookup_citizen_record`
+only accepts an NRIC token that appeared in the citizen's own chat
+message, never one sourced only from document content. Revisited and
+built later the same session — see section 3.
+
+---
+
+## 3. Closing the chain: NRIC token provenance
+
+**Decision to build it after all:** this specific chain (document
+content → cross-citizen disclosure) was reclassified from "leave as a
+red-team target" to "close it" — the access-control gap on
+`lookup_citizen_record` itself (will the agent disclose a *directly
+named* NRIC to the wrong requester) stays exactly as live as before;
+only the document-sourced path closes.
+
+**Solution — deterministic token provenance, not another instruction:**
+every system-prompt rule added this session and the one before it is
+still just an instruction a sufficiently clever prompt can talk the
+model out of (that's what the section 2 finding demonstrated). Instead
+of adding a fourth instruction to the pile, `lookup_citizen_record`'s
+dispatch in `execute_tool_call()` now tracks *where each NRIC token came
+from*, not just what it resolves to:
+- `tokenize_pii()` takes an optional `untrusted_tokens: set`. Called
+  without it for the citizen's own chat message (trusted). Called with
+  the shared set when tokenizing text read via `read_uploaded_document`
+  (untrusted) — every token minted there gets added to the set.
+- Before resolving a `lookup_citizen_record` call's `nric` argument to a
+  real value, `execute_tool_call()` checks whether that token is in
+  `untrusted_tokens`. If it is, the lookup is refused outright — no DB
+  call happens, regardless of what the model intended or how it was
+  talked into making the call.
+- `__SESSION_NRIC__` is seeded directly into `token_map`, never minted by
+  `tokenize_pii()`, so it's never in `untrusted_tokens` — a citizen
+  looking up their own record is completely unaffected, whether they
+  state their own NRIC directly or the agent resolves it from the
+  session.
+
+This is the actual point of a deterministic fix over a prompt rule: it
+doesn't matter how convincing the injected instruction is, or how the
+model reasons about it — the code physically won't run the lookup for a
+token it knows came from document content.
+
+**Verification:**
+- Re-ran the exact adversarial document from section 2's finding, 5
+  trials: **0/5 leaked** (down from 1/5). One trial showed the gate
+  actually fire — the model attempted the call with the document-sourced
+  token, and `execute_tool_call()` returned the refusal error instead of
+  resolving it, with no DB lookup ever executed.
+- Confirmed both legitimate paths are unaffected: a benign document with
+  no NRIC in it still extracts and reports figures correctly; a citizen
+  stating their own NRIC directly in chat (the section 1 authorized
+  case) still resolves and discloses correctly.
+- `promptfoo/ci-regression.yaml`: 6/6, no regression.
 
 ---
 
@@ -174,7 +220,8 @@ live target for injection-via-tool-content practice.
 | Agentic latitude | `call_ollama` generalized from one fixed tool-call round to a bounded ReAct loop (`MAX_TOOL_ROUNDS = 4`) |
 | New capability | `read_uploaded_document` tool + `POST /api/upload` (mock OCR ingestion) |
 | Tool dispatch | `execute_tool_call()` — per-tool safety wrapper dispatcher, replacing the single inline wrapper that only handled `lookup_citizen_record` |
-| Measured finding | Indirect prompt injection via uploaded document → cross-citizen PII disclosure, 1/5 (20%) on `qwen2.5:14b`, deliberately left unfixed |
+| Measured finding | Indirect prompt injection via uploaded document → cross-citizen PII disclosure, 1/5 (20%) on `qwen2.5:14b`, initially left unfixed |
+| Chain closed | Deterministic NRIC-token provenance check (`untrusted_tokens`) in `execute_tool_call()` — refuses to look up any NRIC token minted from document content; re-measured 0/5 after the fix |
 
 ## What's still open
 
@@ -189,12 +236,17 @@ live target for injection-via-tool-content practice.
 - Free-text PII (names, addresses) typed directly into chat or embedded
   in an uploaded document is not caught by `tokenize_pii()`'s NRIC-shaped
   regex — only structured identifiers are. No NER-based detection exists.
-- The document-injection → cross-citizen-disclosure chain (section 2's
-  finding) is live and unfixed by deliberate choice. The scoped-but-
-  unbuilt fix (restrict `lookup_citizen_record` to NRICs sourced from the
-  citizen's own message) is the natural next step if/when this specific
-  chain needs to close.
+  The section 3 provenance check inherits this limit: it only tracks
+  NRIC-shaped tokens, so it says nothing about, e.g., a document
+  embedding a citizen's name to try to get the agent to look them up by
+  name instead of NRIC (not currently a viable attack, since
+  `lookup_citizen_record` only takes an `nric` argument — but worth
+  remembering if the tool's schema ever grows a name-based lookup path).
+- The provenance check is specific to `lookup_citizen_record`'s single
+  `nric` argument. Any future tool that takes an identifier-shaped
+  argument would need its own provenance check added explicitly — it's
+  not a general framework, just the fix scoped to this one case.
 - No automated red-team suite has been run yet against either the
-  tokenization change or the new document tool — verification so far is
-  direct `call_ollama` instrumentation plus the existing
-  `ci-regression.yaml`, which doesn't exercise either new path.
+  tokenization change or the new document tool/provenance check —
+  verification so far is direct `call_ollama` instrumentation plus the
+  existing `ci-regression.yaml`, which doesn't exercise either new path.

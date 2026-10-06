@@ -147,7 +147,7 @@ def read_uploaded_document() -> dict:
 # on inputs / on-prem or VPC hosting), not a code-level control.
 
 
-def tokenize_pii(text: str, token_map: dict) -> str:
+def tokenize_pii(text: str, token_map: dict, untrusted_tokens: set = None) -> str:
     """Replace NRIC-shaped substrings in `text` with placeholder tokens
     (e.g. __NRIC_1__), recording token -> real value in `token_map` so
     the reply can be detokenized afterward. `token_map` is shared across
@@ -159,7 +159,14 @@ def tokenize_pii(text: str, token_map: dict) -> str:
     while generating the JSON tool-call arguments (observed: {{NRIC_1}}
     came back as {{NRIC_1} — one brace short — which silently broke the
     token_map lookup). Underscore-delimited tokens need no JSON escaping
-    and survive round-tripping through tool-call argument generation."""
+    and survive round-tripping through tool-call argument generation.
+
+    If `untrusted_tokens` is given, every token minted by this call is
+    added to it, tagging *where this NRIC string came from* rather than
+    what it is — see the provenance check in execute_tool_call(). Called
+    without it for the citizen's own chat message (trusted); called with
+    the shared set for content read via read_uploaded_document
+    (untrusted)."""
     existing = sum(1 for k in token_map if k.startswith("__NRIC_"))
 
     def replace(match):
@@ -167,6 +174,8 @@ def tokenize_pii(text: str, token_map: dict) -> str:
         existing += 1
         token = f"__NRIC_{existing}__"
         token_map[token] = match.group(0).upper()
+        if untrusted_tokens is not None:
+            untrusted_tokens.add(token)
         return token
 
     return NRIC_PATTERN.sub(replace, text)
@@ -265,33 +274,52 @@ SYSTEM_PROMPT = (
 )
 
 
-def execute_tool_call(call: dict, call_index: int, token_map: dict) -> ToolMessage:
+def execute_tool_call(call: dict, call_index: int, token_map: dict, untrusted_tokens: set) -> ToolMessage:
     """Dispatch one model-requested tool call to the right tool and build
     its ToolMessage, applying whatever safety wrapper that specific tool
     needs. Each tool gets its own wrapper here rather than a shared one,
     because each exposes a different kind of risk: lookup_citizen_record
-    needs token<->NRIC resolution so no real PII enters/leaves the
-    model's context; read_uploaded_document needs explicit untrusted-data
-    framing so injected content inside it isn't mistaken for
-    instructions. `call_index` disambiguates tokens when the model makes
-    more than one tool call in the same round."""
+    needs token<->NRIC resolution (plus the provenance check below) so no
+    real PII enters/leaves the model's context and no lookup runs for an
+    NRIC that only came from untrusted content; read_uploaded_document
+    needs explicit untrusted-data framing so injected content inside it
+    isn't mistaken for instructions. `call_index` disambiguates tokens
+    when the model makes more than one tool call in the same round."""
     name = call["name"]
 
     if name == "lookup_citizen_record":
-        # The model only ever sees/passes tokens, never a real NRIC —
-        # resolve the token back to a real value right here, server-side,
-        # immediately before the DB lookup.
         token_arg = call["args"].get("nric", "")
-        real_nric = token_map.get(token_arg, token_arg)
-        raw_result = lookup_citizen_record.invoke({"nric": real_nric})
-        if "error" in raw_result:
-            # Don't forward the tool's own error message —
-            # lookup_citizen_record() builds it from the real (resolved)
-            # NRIC, which would put the real value right back into the
-            # model's context.
-            content = str({"error": f"no record found for {token_arg}"})
+        # Deterministic gate, not an instruction the model can be talked
+        # out of: refuse to run the lookup at all if this token was
+        # minted from document content (read_uploaded_document), not from
+        # the citizen's own message. Closes the 2026-10-06 finding where
+        # an injected "system notice" inside an uploaded document got the
+        # agent to look up a different citizen's NRIC named in that
+        # document. The citizen's own __SESSION_NRIC__ is unaffected —
+        # it's seeded directly, never minted by tokenize_pii, so it's
+        # never in untrusted_tokens.
+        if token_arg in untrusted_tokens:
+            content = str({
+                "error": (
+                    "cannot look up an NRIC sourced only from uploaded "
+                    "document content — ask the citizen to state it "
+                    "directly in the chat"
+                )
+            })
         else:
-            content = str(mask_record(raw_result, call_index, token_map))
+            # The model only ever sees/passes tokens, never a real NRIC —
+            # resolve the token back to a real value right here,
+            # server-side, immediately before the DB lookup.
+            real_nric = token_map.get(token_arg, token_arg)
+            raw_result = lookup_citizen_record.invoke({"nric": real_nric})
+            if "error" in raw_result:
+                # Don't forward the tool's own error message —
+                # lookup_citizen_record() builds it from the real
+                # (resolved) NRIC, which would put the real value right
+                # back into the model's context.
+                content = str({"error": f"no record found for {token_arg}"})
+            else:
+                content = str(mask_record(raw_result, call_index, token_map))
 
     elif name == "read_uploaded_document":
         raw_result = read_uploaded_document.invoke({})
@@ -301,8 +329,10 @@ def execute_tool_call(call: dict, call_index: int, token_map: dict) -> ToolMessa
             # Any NRIC-shaped text inside the document is tokenized too —
             # otherwise a citizen's own NRIC printed on an uploaded
             # receipt would reach the model un-tokenized, reopening the
-            # exact leak tokenize_pii() closes for chat messages.
-            tokenized_text = tokenize_pii(raw_result["extracted_text"], token_map)
+            # exact leak tokenize_pii() closes for chat messages. Marked
+            # untrusted so the provenance check above can tell these
+            # apart from NRICs the citizen typed directly.
+            tokenized_text = tokenize_pii(raw_result["extracted_text"], token_map, untrusted_tokens)
             content = (
                 "<untrusted_citizen_document>\n"
                 f"{tokenized_text}\n"
@@ -344,9 +374,14 @@ def call_ollama(question: str, docs: list, timeout: int = 120, retries: int = 1)
     NRICs and tool-result fields are tokenized before anything is added to
     the model's context (tokenize_pii/mask_record) and detokenized only on
     the way out (detokenize) — see the "PII tokenization" comment above
-    SYSTEM_PROMPT. token_map is local to this one call/question."""
+    SYSTEM_PROMPT. token_map/untrusted_tokens are local to this one
+    call/question. untrusted_tokens tracks which NRIC tokens were minted
+    from document content rather than the citizen's own message, so
+    execute_tool_call() can deterministically refuse to look one up —
+    see the provenance check there."""
     context = "\n\n".join(f"[{d['id']}] {d['text']}" for d in docs) or "(no matching excerpts found)"
     token_map = {"__SESSION_NRIC__": SESSION_NRIC}
+    untrusted_tokens = set()
     tokenized_question = tokenize_pii(question, token_map)
 
     llm = ChatOllama(
@@ -370,7 +405,7 @@ def call_ollama(question: str, docs: list, timeout: int = 120, retries: int = 1)
                 rounds += 1
                 messages.append(response)
                 for idx, call in enumerate(response.tool_calls, start=1):
-                    messages.append(execute_tool_call(call, idx, token_map))
+                    messages.append(execute_tool_call(call, idx, token_map, untrusted_tokens))
                 response = llm_with_tools.invoke(messages)
 
             text = (response.content or "").strip()
